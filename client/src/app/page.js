@@ -3,7 +3,9 @@
 
 import { useCallback, useEffect, useState } from "react";
 
-const API_URL = "http://localhost:5000/api/returns";
+const API_URL = `${
+  process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000"
+}/api/returns`;
 
 const statuses = ["Open", "In Review", "Approved", "Rejected", "Completed"];
 

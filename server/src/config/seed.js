@@ -20,35 +20,42 @@ const statuses = [
   "Completed",
 ];
 
-const resolutions = [
-  null,
-  null,
-  "Refund",
-  null,
-  "Replacement",
-];
+const resolutions = {
+  Approved: "Refund",
+  Completed: "Replacement",
+};
 
 async function seed() {
+  const client = await pool.connect();
+
   try {
+    await client.query("BEGIN");
+
     for (let i = 1; i <= 30; i++) {
-      const statusIndex = (i - 1) % statuses.length;
-      const status = statuses[statusIndex];
-      const resolution = resolutions[statusIndex];
+      const status = statuses[(i - 1) % statuses.length];
+
+      const resolution = resolutions[status] || null;
 
       const refundAmount =
-        status === "Approved" && resolution === "Refund"
-          ? 250 + i * 10
-          : null;
+        resolution === "Refund" ? 250 + i * 10 : null;
 
       const reference = `RD-${randomUUID()}`;
 
-      const result = await pool.query(
+      const result = await client.query(
         `INSERT INTO return_requests (
-          reference, order_number, customer_name,
-          customer_email, customer_phone, item_name,
-          quantity, reason, status, resolution, refund_amount
+          reference,
+          order_number,
+          customer_name,
+          customer_email,
+          customer_phone,
+          item_name,
+          quantity,
+          reason,
+          status,
+          resolution,
+          refund_amount
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         RETURNING id`,
         [
           reference,
@@ -66,7 +73,7 @@ async function seed() {
       );
 
       if (i % 3 === 0) {
-        await pool.query(
+        await client.query(
           `INSERT INTO return_notes (request_id, note)
            VALUES ($1, $2)`,
           [
@@ -77,11 +84,16 @@ async function seed() {
       }
     }
 
+    await client.query("COMMIT");
+
     console.log("Successfully created 30 sample return requests.");
+    console.log("Created 10 sample notes.");
   } catch (error) {
+    await client.query("ROLLBACK");
     console.error("Seeding failed:", error.message);
     process.exitCode = 1;
   } finally {
+    client.release();
     await pool.end();
   }
 }

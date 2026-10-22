@@ -13,7 +13,52 @@ const allowedReasons = [
   "Changed Mind",
 ];
 
-router.post("/", async (req, res) => {
+const allowedStatuses = [
+  "Open",
+  "In Review",
+  "Approved",
+  "Rejected",
+  "Completed",
+];
+
+const allowedResolutions = [
+  "Refund",
+  "Replacement",
+  "Store Credit",
+];
+
+const allowedSortFields = {
+  created_at: "created_at",
+  updated_at: "updated_at",
+  reference: "reference",
+  status: "status",
+  order_number: "order_number",
+  customer_name: "customer_name",
+};
+
+const transitions = {
+  Open: ["In Review"],
+  "In Review": ["Approved", "Rejected"],
+  Approved: ["Completed"],
+  Rejected: [],
+  Completed: [],
+};
+
+function sendError(res, status, code, message) {
+  return res.status(status).json({
+    error: { code, message },
+  });
+}
+
+function isValidId(id) {
+  return /^\d+$/.test(String(id)) && Number(id) > 0;
+}
+
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function validateRequestDetails(body = {}) {
   const {
     order_number,
     customer_name,
@@ -22,70 +67,163 @@ router.post("/", async (req, res) => {
     item_name,
     quantity,
     reason,
-  } = req.body || {};
-
-  const order = typeof order_number === "string" ? order_number.trim() : "";
-  const name = typeof customer_name === "string" ? customer_name.trim() : "";
-  const email = typeof customer_email === "string" ? customer_email.trim() : "";
-  const phone = typeof customer_phone === "string" ? customer_phone.trim() : "";
-  const item = typeof item_name === "string" ? item_name.trim() : "";
+  } = body;
 
   if (
-    !order ||
-    !name ||
-    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
-    !item ||
+    typeof order_number !== "string" ||
+    !order_number.trim() ||
+    typeof customer_name !== "string" ||
+    !customer_name.trim() ||
+    typeof customer_email !== "string" ||
+    !isValidEmail(customer_email.trim()) ||
+    typeof item_name !== "string" ||
+    !item_name.trim() ||
     !Number.isInteger(quantity) ||
     quantity <= 0 ||
-    !allowedReasons.includes(reason)
+    !allowedReasons.includes(reason) ||
+    (customer_phone != null && typeof customer_phone !== "string")
   ) {
-    return res.status(400).json({
-      error: {
-        code: "VALIDATION_ERROR",
-        message: "Provide valid order, customer, email, item, quantity, and reason details.",
-      },
-    });
+    return null;
+  }
+
+  if (
+    order_number.trim().length > 100 ||
+    customer_name.trim().length > 150 ||
+    customer_email.trim().length > 255 ||
+    item_name.trim().length > 200 ||
+    (customer_phone && customer_phone.trim().length > 30) ||
+    quantity > 10000
+  ) {
+    return null;
+  }
+
+  return {
+    // CHANGE: order numbers are always stored in uppercase
+    order_number: order_number.trim().toUpperCase(),
+    customer_name: customer_name.trim(),
+    customer_email: customer_email.trim(),
+    customer_phone: customer_phone?.trim() || null,
+    item_name: item_name.trim(),
+    quantity,
+    reason,
+  };
+}
+
+function handleDatabaseError(res, error, operation) {
+  console.error(`${operation} failed:`, error.message);
+
+  if (
+    error.code === "23505" &&
+    error.constraint === "uq_live_return_order_item"
+  ) {
+    return sendError(
+      res,
+      409,
+      "DUPLICATE_LIVE_REQUEST",
+      "An active return request already exists for this item and order."
+    );
+  }
+
+  if (error.code === "23514") {
+    return sendError(
+      res,
+      400,
+      "CONSTRAINT_VIOLATION",
+      "The supplied values violate a database rule."
+    );
+  }
+
+  if (error.code === "23503") {
+    return sendError(
+      res,
+      400,
+      "INVALID_REFERENCE",
+      "The related database record does not exist."
+    );
+  }
+
+  return sendError(
+    res,
+    500,
+    "INTERNAL_SERVER_ERROR",
+    `Unable to ${operation.toLowerCase()}.`
+  );
+}
+
+async function lockOrderAndItem(client, orderNumber, itemName) {
+  await client.query(
+    `SELECT pg_advisory_xact_lock(
+       hashtext(LOWER(TRIM($1))),
+       hashtext(LOWER(TRIM($2)))
+     )`,
+    [orderNumber, itemName]
+  );
+}
+async function findDuplicate(client, orderNumber, itemName, excludeId = null) {
+  const values = [orderNumber];
+
+  let exclusion = "";
+
+  if (excludeId !== null) {
+    values.push(excludeId);
+    exclusion = `AND id <> $2`;
+  }
+
+  const result = await client.query(
+    `SELECT id
+     FROM return_requests
+     WHERE regexp_replace(LOWER($1), '[^a-z0-9]', '', 'g')
+         = regexp_replace(LOWER(order_number), '[^a-z0-9]', '', 'g')
+       AND status NOT IN ('Rejected', 'Completed')
+       AND is_deleted = FALSE
+       ${exclusion}
+     LIMIT 1`,
+    values
+  );
+
+  return result.rows.length > 0;
+}
+
+/* CREATE RETURN REQUEST */
+router.post("/", async (req, res) => {
+  const details = validateRequestDetails(req.body);
+
+  if (!details) {
+    return sendError(
+      res,
+      400,
+      "VALIDATION_ERROR",
+      "Provide valid order, customer, email, item, quantity, and reason details."
+    );
   }
 
   let client;
-  let transactionStarted = false;
 
   try {
     client = await pool.connect();
-
     await client.query("BEGIN");
-    transactionStarted = true;
 
-    // Serialize creation attempts for the same order and item.
-    await client.query(
-      `SELECT pg_advisory_xact_lock(
-         hashtext(LOWER($1)),
-         hashtext(LOWER($2))
-       )`,
-      [order, item]
+    await lockOrderAndItem(
+      client,
+      details.order_number,
+      details.item_name
     );
 
-    const duplicate = await client.query(
-      `SELECT id
-       FROM return_requests
-       WHERE LOWER(TRIM(order_number)) = LOWER($1)
-         AND LOWER(TRIM(item_name)) = LOWER($2)
-         AND status NOT IN ('Rejected', 'Completed')
-         AND is_deleted = FALSE
-       LIMIT 1`,
-      [order, item]
+    const duplicate = await findDuplicate(
+      client,
+      details.order_number,
+      details.item_name
     );
 
-    if (duplicate.rows.length > 0) {
+    if (duplicate) {
       await client.query("ROLLBACK");
-      transactionStarted = false;
 
-      return res.status(409).json({
-        error: {
-          code: "DUPLICATE_LIVE_REQUEST",
-          message: "An active return request already exists for this item and order.",
-        },
-      });
+      return sendError(
+        res,
+        409,
+        "DUPLICATE_LIVE_REQUEST",
+        "An active return request already exists for this item and order."
+      );
     }
 
     const reference = `RD-${randomUUID()}`;
@@ -105,25 +243,24 @@ router.post("/", async (req, res) => {
        RETURNING *`,
       [
         reference,
-        order,
-        name,
-        email,
-        phone || null,
-        item,
-        quantity,
-        reason,
+        details.order_number,
+        details.customer_name,
+        details.customer_email,
+        details.customer_phone,
+        details.item_name,
+        details.quantity,
+        details.reason,
       ]
     );
 
     await client.query("COMMIT");
-    transactionStarted = false;
 
     return res.status(201).json({
       message: "Return request created successfully.",
       data: result.rows[0],
     });
   } catch (error) {
-    if (client && transactionStarted) {
+    if (client) {
       try {
         await client.query("ROLLBACK");
       } catch (rollbackError) {
@@ -131,38 +268,13 @@ router.post("/", async (req, res) => {
       }
     }
 
-    console.error("Create return request failed:", error.message);
-
-    return res.status(500).json({
-      error: {
-        code: "INTERNAL_SERVER_ERROR",
-        message: "Unable to create the return request.",
-      },
-    });
+    return handleDatabaseError(res, error, "Create return request");
   } finally {
-    if (client) {
-      client.release();
-    }
+    if (client) client.release();
   }
 });
 
-const allowedStatuses = [
-  "Open",
-  "In Review",
-  "Approved",
-  "Rejected",
-  "Completed",
-];
-
-const allowedSortFields = {
-  created_at: "created_at",
-  updated_at: "updated_at",
-  reference: "reference",
-  status: "status",
-  order_number: "order_number",
-  customer_name: "customer_name",
-};
-
+/* LIST, SEARCH, FILTER, SORT, AND PAGINATE */
 router.get("/", async (req, res) => {
   try {
     const search =
@@ -170,55 +282,67 @@ router.get("/", async (req, res) => {
         ? req.query.search.trim()
         : "";
 
-    const { status, reason, sortBy = "created_at", sortOrder = "desc" } =
-      req.query;
+    const status =
+      typeof req.query.status === "string" ? req.query.status : "";
+
+    const reason =
+      typeof req.query.reason === "string" ? req.query.reason : "";
+
+    const sortBy =
+      typeof req.query.sortBy === "string"
+        ? req.query.sortBy
+        : "created_at";
+
+    const sortOrder =
+      typeof req.query.sortOrder === "string"
+        ? req.query.sortOrder.toLowerCase()
+        : "desc";
 
     const page = Number(req.query.page ?? 1);
     const limit = Number(req.query.limit ?? 10);
 
     if (
-      !Number.isInteger(page) ||
+      !Number.isSafeInteger(page) ||
       page < 1 ||
-      !Number.isInteger(limit) ||
+      !Number.isSafeInteger(limit) ||
       limit < 1 ||
       limit > 100
     ) {
-      return res.status(400).json({
-        error: {
-          code: "INVALID_PAGINATION",
-          message: "Page must be positive and limit must be between 1 and 100.",
-        },
-      });
+      return sendError(
+        res,
+        400,
+        "INVALID_PAGINATION",
+        "Page must be a positive integer and limit must be between 1 and 100."
+      );
     }
 
     if (status && !allowedStatuses.includes(status)) {
-      return res.status(400).json({
-        error: {
-          code: "INVALID_STATUS",
-          message: "Invalid status filter.",
-        },
-      });
+      return sendError(
+        res,
+        400,
+        "INVALID_STATUS",
+        "Invalid status filter."
+      );
     }
 
     if (reason && !allowedReasons.includes(reason)) {
-      return res.status(400).json({
-        error: {
-          code: "INVALID_REASON",
-          message: "Invalid reason filter.",
-        },
-      });
+      return sendError(
+        res,
+        400,
+        "INVALID_REASON",
+        "Invalid reason filter."
+      );
     }
 
     const sortColumn = allowedSortFields[sortBy];
-    const direction = String(sortOrder).toLowerCase();
 
-    if (!sortColumn || !["asc", "desc"].includes(direction)) {
-      return res.status(400).json({
-        error: {
-          code: "INVALID_SORT",
-          message: "Invalid sort field or sort order.",
-        },
-      });
+    if (!sortColumn || !["asc", "desc"].includes(sortOrder)) {
+      return sendError(
+        res,
+        400,
+        "INVALID_SORT",
+        "Invalid sort field or sort order."
+      );
     }
 
     const conditions = ["is_deleted = FALSE"];
@@ -226,12 +350,14 @@ router.get("/", async (req, res) => {
 
     if (search) {
       values.push(`%${search}%`);
+      const index = values.length;
+
       conditions.push(
-        `(customer_name ILIKE $${values.length}
-          OR customer_email ILIKE $${values.length}
-          OR order_number ILIKE $${values.length}
-          OR reference ILIKE $${values.length}
-          OR item_name ILIKE $${values.length})`
+        `(customer_name ILIKE $${index}
+          OR customer_email ILIKE $${index}
+          OR order_number ILIKE $${index}
+          OR reference ILIKE $${index}
+          OR item_name ILIKE $${index})`
       );
     }
 
@@ -261,7 +387,7 @@ router.get("/", async (req, res) => {
       `SELECT *
        FROM return_requests
        WHERE ${whereClause}
-       ORDER BY ${sortColumn} ${direction.toUpperCase()}, id DESC
+       ORDER BY ${sortColumn} ${sortOrder.toUpperCase()}, id DESC
        LIMIT $${values.length + 1}
        OFFSET $${values.length + 2}`,
       [...values, limit, offset]
@@ -277,28 +403,21 @@ router.get("/", async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("List return requests failed:", error.message);
-
-    return res.status(500).json({
-      error: {
-        code: "INTERNAL_SERVER_ERROR",
-        message: "Unable to retrieve return requests.",
-      },
-    });
+    return handleDatabaseError(res, error, "Retrieve return requests");
   }
 });
 
-/* Get one return request with its notes */
+/* GET ONE REQUEST WITH CHRONOLOGICAL NOTES */
 router.get("/:id", async (req, res) => {
   const { id } = req.params;
 
-  if (!/^\d+$/.test(id) || Number(id) < 1) {
-    return res.status(400).json({
-      error: {
-        code: "INVALID_ID",
-        message: "Request ID must be a positive integer.",
-      },
-    });
+  if (!isValidId(id)) {
+    return sendError(
+      res,
+      400,
+      "INVALID_ID",
+      "Request ID must be a positive integer."
+    );
   }
 
   try {
@@ -309,13 +428,13 @@ router.get("/:id", async (req, res) => {
       [id]
     );
 
-    if (requestResult.rows.length === 0) {
-      return res.status(404).json({
-        error: {
-          code: "REQUEST_NOT_FOUND",
-          message: "Return request not found.",
-        },
-      });
+    if (!requestResult.rows.length) {
+      return sendError(
+        res,
+        404,
+        "REQUEST_NOT_FOUND",
+        "Return request not found."
+      );
     }
 
     const notesResult = await pool.query(
@@ -333,156 +452,140 @@ router.get("/:id", async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("Get return request failed:", error.message);
-
-    return res.status(500).json({
-      error: {
-        code: "INTERNAL_SERVER_ERROR",
-        message: "Unable to retrieve the return request.",
-      },
-    });
+    return handleDatabaseError(res, error, "Retrieve the return request");
   }
 });
 
-/* Add a note to a return request */
+/* ADD NOTE — NOTES ARE APPEND-ONLY THROUGH THIS API */
 router.post("/:id/notes", async (req, res) => {
   const { id } = req.params;
-  const note = typeof req.body?.note === "string"
-    ? req.body.note.trim()
-    : "";
 
-  if (!/^\d+$/.test(id) || Number(id) < 1) {
-    return res.status(400).json({
-      error: {
-        code: "INVALID_ID",
-        message: "Request ID must be a positive integer.",
-      },
-    });
+  const note =
+    typeof req.body?.note === "string" ? req.body.note.trim() : "";
+
+  if (!isValidId(id)) {
+    return sendError(
+      res,
+      400,
+      "INVALID_ID",
+      "Request ID must be a positive integer."
+    );
   }
 
   if (!note) {
-    return res.status(400).json({
-      error: {
-        code: "INVALID_NOTE",
-        message: "Note cannot be empty.",
-      },
-    });
+    return sendError(
+      res,
+      400,
+      "INVALID_NOTE",
+      "Note cannot be empty."
+    );
   }
 
   try {
-    const requestResult = await pool.query(
-      `SELECT id
-       FROM return_requests
-       WHERE id = $1 AND is_deleted = FALSE`,
-      [id]
-    );
-
-    if (requestResult.rows.length === 0) {
-      return res.status(404).json({
-        error: {
-          code: "REQUEST_NOT_FOUND",
-          message: "Return request not found.",
-        },
-      });
-    }
-
     const result = await pool.query(
       `INSERT INTO return_notes (request_id, note)
-       VALUES ($1, $2)
+       SELECT id, $2
+       FROM return_requests
+       WHERE id = $1 AND is_deleted = FALSE
        RETURNING id, request_id, note, created_at`,
       [id, note]
     );
+
+    if (!result.rows.length) {
+      return sendError(
+        res,
+        404,
+        "REQUEST_NOT_FOUND",
+        "Return request not found."
+      );
+    }
 
     return res.status(201).json({
       message: "Note added successfully.",
       data: result.rows[0],
     });
   } catch (error) {
-    console.error("Add note failed:", error.message);
-
-    return res.status(500).json({
-      error: {
-        code: "INTERNAL_SERVER_ERROR",
-        message: "Unable to add the note.",
-      },
-    });
+    return handleDatabaseError(res, error, "Add note");
   }
 });
 
+/* UPDATE STATUS WITH VALIDATION AND LEGAL TRANSITIONS */
 router.patch("/:id/status", async (req, res) => {
-  const id = req.params.id;
+  const { id } = req.params;
   const { status, resolution, refund_amount } = req.body || {};
 
-  if (!/^\d+$/.test(id) || Number(id) <= 0) {
-    return res.status(400).json({
-      error: {
-        code: "INVALID_ID",
-        message: "A valid request ID is required.",
-      },
-    });
+  if (!isValidId(id)) {
+    return sendError(
+      res,
+      400,
+      "INVALID_ID",
+      "A valid request ID is required."
+    );
   }
 
-  const transitions = {
-    "Open": ["In Review"],
-    "In Review": ["Approved", "Rejected"],
-    "Approved": ["Completed"],
-    "Rejected": [],
-    "Completed": [],
-  };
-
-  if (!Object.prototype.hasOwnProperty.call(transitions, status)) {
-    return res.status(400).json({
-      error: {
-        code: "INVALID_STATUS",
-        message: "The requested status is invalid.",
-      },
-    });
+  if (
+    typeof status !== "string" ||
+    !Object.prototype.hasOwnProperty.call(transitions, status)
+  ) {
+    return sendError(
+      res,
+      400,
+      "INVALID_STATUS",
+      "The requested status is invalid."
+    );
   }
+
+  let client;
 
   try {
-    const currentResult = await pool.query(
-      `SELECT * FROM return_requests
-       WHERE id = $1 AND is_deleted = FALSE`,
+    client = await pool.connect();
+    await client.query("BEGIN");
+
+    const currentResult = await client.query(
+      `SELECT *
+       FROM return_requests
+       WHERE id = $1 AND is_deleted = FALSE
+       FOR UPDATE`,
       [id]
     );
 
-    if (currentResult.rows.length === 0) {
-      return res.status(404).json({
-        error: {
-          code: "REQUEST_NOT_FOUND",
-          message: "Return request not found.",
-        },
-      });
+    if (!currentResult.rows.length) {
+      await client.query("ROLLBACK");
+
+      return sendError(
+        res,
+        404,
+        "REQUEST_NOT_FOUND",
+        "Return request not found."
+      );
     }
 
     const current = currentResult.rows[0];
 
     if (!transitions[current.status].includes(status)) {
-      return res.status(409).json({
-        error: {
-          code: "INVALID_TRANSITION",
-          message: `Cannot change status from ${current.status} to ${status}.`,
-        },
-      });
+      await client.query("ROLLBACK");
+
+      return sendError(
+        res,
+        409,
+        "INVALID_TRANSITION",
+        `Cannot change status from ${current.status} to ${status}.`
+      );
     }
 
     let finalResolution = current.resolution;
     let finalRefundAmount = current.refund_amount;
 
     if (status === "Approved") {
-      const allowedResolutions = [
-        "Refund",
-        "Replacement",
-        "Store Credit",
-      ];
-
       if (!allowedResolutions.includes(resolution)) {
-        return res.status(400).json({
-          error: {
-            code: "INVALID_RESOLUTION",
-            message: "Choose Refund, Replacement, or Store Credit.",
-          },
-        });
+        await client.query("ROLLBACK");
+
+        return sendError(
+          res,
+          400,
+          "INVALID_RESOLUTION",
+          "Choose Refund, Replacement, or Store Credit."
+        );
       }
 
       if (resolution === "Refund") {
@@ -491,16 +594,19 @@ router.patch("/:id/status", async (req, res) => {
         if (
           refund_amount === null ||
           refund_amount === undefined ||
-          refund_amount === "" ||
+          (typeof refund_amount === "string" &&
+            refund_amount.trim() === "") ||
           !Number.isFinite(amount) ||
           amount <= 0
         ) {
-          return res.status(400).json({
-            error: {
-              code: "INVALID_REFUND_AMOUNT",
-              message: "A refund requires an amount greater than zero.",
-            },
-          });
+          await client.query("ROLLBACK");
+
+          return sendError(
+            res,
+            400,
+            "INVALID_REFUND_AMOUNT",
+            "A refund requires an amount greater than zero."
+          );
         }
 
         finalRefundAmount = amount;
@@ -510,21 +616,35 @@ router.patch("/:id/status", async (req, res) => {
           refund_amount !== undefined &&
           refund_amount !== ""
         ) {
-          return res.status(400).json({
-            error: {
-              code: "REFUND_NOT_ALLOWED",
-              message: "Refund amount must be omitted for non-refund resolutions.",
-            },
-          });
+          await client.query("ROLLBACK");
+
+          return sendError(
+            res,
+            400,
+            "REFUND_NOT_ALLOWED",
+            "Do not provide a refund amount for Replacement or Store Credit."
+          );
         }
 
         finalRefundAmount = null;
       }
 
       finalResolution = resolution;
+    } else if (
+      resolution !== undefined ||
+      refund_amount !== undefined
+    ) {
+      await client.query("ROLLBACK");
+
+      return sendError(
+        res,
+        400,
+        "UNEXPECTED_RESOLUTION",
+        "Resolution and refund amount can only be supplied when approving a request."
+      );
     }
 
-    const result = await pool.query(
+    const result = await client.query(
       `UPDATE return_requests
        SET status = $1,
            resolution = $2,
@@ -535,311 +655,114 @@ router.patch("/:id/status", async (req, res) => {
       [status, finalResolution, finalRefundAmount, id]
     );
 
+    await client.query("COMMIT");
+
     return res.status(200).json({
       message: "Return request status updated successfully.",
       data: result.rows[0],
     });
   } catch (error) {
-    console.error("Status update failed:", error.message);
-
-    return res.status(500).json({
-      error: {
-        code: "INTERNAL_SERVER_ERROR",
-        message: "Unable to update the return request status.",
-      },
-    });
-  }
-});
-
-router.patch("/:id", async (req, res) => {
-  const id = req.params.id;
-
-  if (!/^\d+$/.test(id) || Number(id) <= 0) {
-    return res.status(400).json({
-      error: {
-        code: "INVALID_ID",
-        message: "A valid request ID is required.",
-      },
-    });
-  }
-
-  const {
-    order_number,
-    customer_name,
-    customer_email,
-    customer_phone,
-    item_name,
-    quantity,
-    reason,
-  } = req.body || {};
-
-  const allowedReasons = [
-    "Damaged",
-    "Wrong Item",
-    "Size Issue",
-    "Not As Described",
-    "Changed Mind",
-  ];
-
-  if (
-    typeof order_number !== "string" || !order_number.trim() ||
-    typeof customer_name !== "string" || !customer_name.trim() ||
-    typeof customer_email !== "string" ||
-    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customer_email.trim()) ||
-    typeof item_name !== "string" || !item_name.trim() ||
-    !Number.isInteger(quantity) || quantity <= 0 ||
-    !allowedReasons.includes(reason) ||
-    (customer_phone != null && typeof customer_phone !== "string")
-  ) {
-    return res.status(400).json({
-      error: {
-        code: "VALIDATION_ERROR",
-        message: "Provide valid request details.",
-      },
-    });
-  }
-
-  try {
-    const currentResult = await pool.query(
-      `SELECT * FROM return_requests
-       WHERE id = $1 AND is_deleted = FALSE`,
-      [id]
-    );
-
-    if (currentResult.rows.length === 0) {
-      return res.status(404).json({
-        error: {
-          code: "REQUEST_NOT_FOUND",
-          message: "Return request not found.",
-        },
-      });
-    }
-
-    const current = currentResult.rows[0];
-
-    if (!["Open", "In Review"].includes(current.status)) {
-      return res.status(409).json({
-        error: {
-          code: "REQUEST_LOCKED",
-          message: "Request details cannot be edited after a decision.",
-        },
-      });
-    }
-
-    const duplicate = await pool.query(
-      `SELECT id FROM return_requests
-       WHERE id <> $1
-         AND LOWER(TRIM(order_number)) = LOWER($2)
-         AND LOWER(TRIM(item_name)) = LOWER($3)
-         AND status NOT IN ('Rejected', 'Completed')
-         AND is_deleted = FALSE
-       LIMIT 1`,
-      [id, order_number.trim(), item_name.trim()]
-    );
-
-    if (duplicate.rows.length > 0) {
-      return res.status(409).json({
-        error: {
-          code: "DUPLICATE_LIVE_REQUEST",
-          message: "An active request already exists for this item and order.",
-        },
-      });
-    }
-
-    const result = await pool.query(
-      `UPDATE return_requests
-       SET order_number = $1,
-           customer_name = $2,
-           customer_email = $3,
-           customer_phone = $4,
-           item_name = $5,
-           quantity = $6,
-           reason = $7,
-           updated_at = NOW()
-       WHERE id = $8 AND is_deleted = FALSE
-       RETURNING *`,
-      [
-        order_number.trim(),
-        customer_name.trim(),
-        customer_email.trim(),
-        customer_phone?.trim() || null,
-        item_name.trim(),
-        quantity,
-        reason,
-        id,
-      ]
-    );
-
-    return res.status(200).json({
-      message: "Return request updated successfully.",
-      data: result.rows[0],
-    });
-  } catch (error) {
-    console.error("Edit request failed:", error.message);
-
-    return res.status(500).json({
-      error: {
-        code: "INTERNAL_SERVER_ERROR",
-        message: "Unable to update the return request.",
-      },
-    });
-  }
-});
-
-router.delete("/:id", async (req, res) => {
-  const id = req.params.id;
-
-  if (!/^\d+$/.test(id) || Number(id) <= 0) {
-    return res.status(400).json({
-      error: {
-        code: "INVALID_ID",
-        message: "A valid request ID is required.",
-      },
-    });
-  }
-
-  try {
-    const result = await pool.query(
-      `UPDATE return_requests
-       SET is_deleted = TRUE, updated_at = NOW()
-       WHERE id = $1
-         AND is_deleted = FALSE
-         AND status IN ('Open', 'Rejected')
-       RETURNING id, reference, status, is_deleted`,
-      [id]
-    );
-
-    if (result.rows.length === 0) {
-      const existing = await pool.query(
-        `SELECT id, status, is_deleted
-         FROM return_requests WHERE id = $1`,
-        [id]
-      );
-
-      if (existing.rows.length === 0 || existing.rows[0].is_deleted) {
-        return res.status(404).json({
-          error: {
-            code: "REQUEST_NOT_FOUND",
-            message: "Return request not found.",
-          },
-        });
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("Rollback failed:", rollbackError.message);
       }
-
-      return res.status(409).json({
-        error: {
-          code: "DELETE_NOT_ALLOWED",
-          message: "Only Open or Rejected requests can be removed.",
-        },
-      });
     }
 
-    return res.status(200).json({
-      message: "Return request removed successfully.",
-      data: result.rows[0],
-    });
-  } catch (error) {
-    console.error("Delete request failed:", error.message);
-
-    return res.status(500).json({
-      error: {
-        code: "INTERNAL_SERVER_ERROR",
-        message: "Unable to remove the return request.",
-      },
-    });
+    return handleDatabaseError(res, error, "Update return request status");
+  } finally {
+    if (client) client.release();
   }
 });
-// PATCH /api/returns/:id
-// Edit customer and item details before a decision is made.
+
+/* EDIT DETAILS — ONLY WHILE OPEN OR IN REVIEW */
 router.patch("/:id", async (req, res) => {
   const { id } = req.params;
-  const {
-    order_number,
-    customer_name,
-    customer_email,
-    customer_phone,
-    item_name,
-    quantity,
-    reason,
-  } = req.body || {};
 
-  if (!/^\d+$/.test(id) || Number(id) <= 0) {
-    return res.status(400).json({
-      error: { code: "INVALID_ID", message: "A valid request ID is required." },
-    });
+  if (!isValidId(id)) {
+    return sendError(
+      res,
+      400,
+      "INVALID_ID",
+      "A valid request ID is required."
+    );
   }
 
-  const allowedReasons = [
-    "Damaged",
-    "Wrong Item",
-    "Size Issue",
-    "Not As Described",
-    "Changed Mind",
-  ];
+  const details = validateRequestDetails(req.body);
 
-  if (
-    typeof order_number !== "string" || !order_number.trim() ||
-    typeof customer_name !== "string" || !customer_name.trim() ||
-    typeof customer_email !== "string" ||
-    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customer_email.trim()) ||
-    typeof item_name !== "string" || !item_name.trim() ||
-    !Number.isInteger(Number(quantity)) || Number(quantity) <= 0 ||
-    !allowedReasons.includes(reason) ||
-    (customer_phone != null && typeof customer_phone !== "string")
-  ) {
-    return res.status(400).json({
-      error: {
-        code: "INVALID_REQUEST_DETAILS",
-        message: "Provide valid order, customer, item, quantity, email, and reason details.",
-      },
-    });
+  if (!details) {
+    return sendError(
+      res,
+      400,
+      "VALIDATION_ERROR",
+      "Provide valid order, customer, email, item, quantity, and reason details."
+    );
   }
+
+  let client;
 
   try {
-    const currentResult = await pool.query(
-      `SELECT * FROM return_requests
-       WHERE id = $1 AND is_deleted = FALSE`,
+    client = await pool.connect();
+    await client.query("BEGIN");
+
+    const currentResult = await client.query(
+      `SELECT *
+       FROM return_requests
+       WHERE id = $1 AND is_deleted = FALSE
+       FOR UPDATE`,
       [id]
     );
 
     if (!currentResult.rows.length) {
-      return res.status(404).json({
-        error: { code: "REQUEST_NOT_FOUND", message: "Return request not found." },
-      });
+      await client.query("ROLLBACK");
+
+      return sendError(
+        res,
+        404,
+        "REQUEST_NOT_FOUND",
+        "Return request not found."
+      );
     }
 
     const current = currentResult.rows[0];
 
     if (!["Open", "In Review"].includes(current.status)) {
-      return res.status(409).json({
-        error: {
-          code: "DETAILS_LOCKED",
-          message: "Request details cannot be edited after a decision.",
-        },
-      });
+      await client.query("ROLLBACK");
+
+      return sendError(
+        res,
+        409,
+        "REQUEST_LOCKED",
+        "Request details cannot be edited after a decision."
+      );
     }
 
-    // Prevent another active request for the same order and item.
-    const duplicate = await pool.query(
-      `SELECT id FROM return_requests
-       WHERE id <> $1
-         AND LOWER(TRIM(order_number)) = LOWER(TRIM($2))
-         AND LOWER(TRIM(item_name)) = LOWER(TRIM($3))
-         AND status NOT IN ('Rejected', 'Completed')
-         AND is_deleted = FALSE
-       LIMIT 1`,
-      [id, order_number.trim(), item_name.trim()]
+    await lockOrderAndItem(
+      client,
+      details.order_number,
+      details.item_name
     );
 
-    if (duplicate.rows.length) {
-      return res.status(409).json({
-        error: {
-          code: "DUPLICATE_LIVE_REQUEST",
-          message: "An active return request already exists for this order and item.",
-        },
-      });
+    const duplicate = await findDuplicate(
+      client,
+      details.order_number,
+      details.item_name,
+      id
+    );
+
+    if (duplicate) {
+      await client.query("ROLLBACK");
+
+      return sendError(
+        res,
+        409,
+        "DUPLICATE_LIVE_REQUEST",
+        "An active return request already exists for this item and order."
+      );
     }
 
-    const result = await pool.query(
+    const result = await client.query(
       `UPDATE return_requests
        SET order_number = $1,
            customer_name = $2,
@@ -854,107 +777,108 @@ router.patch("/:id", async (req, res) => {
          AND is_deleted = FALSE
        RETURNING *`,
       [
-        order_number.trim(),
-        customer_name.trim(),
-        customer_email.trim(),
-        customer_phone?.trim() || null,
-        item_name.trim(),
-        Number(quantity),
-        reason,
+        details.order_number,
+        details.customer_name,
+        details.customer_email,
+        details.customer_phone,
+        details.item_name,
+        details.quantity,
+        details.reason,
         id,
       ]
     );
 
     if (!result.rows.length) {
-      return res.status(409).json({
-        error: {
-          code: "REQUEST_CHANGED",
-          message: "The request changed. Refresh and try again.",
-        },
-      });
+      await client.query("ROLLBACK");
+
+      return sendError(
+        res,
+        409,
+        "REQUEST_CHANGED",
+        "The request changed. Refresh and try again."
+      );
     }
+
+    await client.query("COMMIT");
 
     return res.status(200).json({
       message: "Return request updated successfully.",
       data: result.rows[0],
     });
   } catch (error) {
-    console.error("Edit request failed:", error.message);
-    return res.status(500).json({
-      error: {
-        code: "INTERNAL_SERVER_ERROR",
-        message: "Unable to update return request.",
-      },
-    });
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("Rollback failed:", rollbackError.message);
+      }
+    }
+
+    return handleDatabaseError(res, error, "Edit return request");
+  } finally {
+    if (client) client.release();
   }
 });
 
-
-// DELETE /api/returns/:id
-// Soft-delete only: keep the record in PostgreSQL.
+/* SOFT DELETE — ONLY OPEN OR REJECTED REQUESTS */
 router.delete("/:id", async (req, res) => {
   const { id } = req.params;
 
-  if (!/^\d+$/.test(id) || Number(id) <= 0) {
-    return res.status(400).json({
-      error: { code: "INVALID_ID", message: "A valid request ID is required." },
-    });
+  if (!isValidId(id)) {
+    return sendError(
+      res,
+      400,
+      "INVALID_ID",
+      "A valid request ID is required."
+    );
   }
 
   try {
-    const currentResult = await pool.query(
-      `SELECT status FROM return_requests
-       WHERE id = $1 AND is_deleted = FALSE`,
-      [id]
-    );
-
-    if (!currentResult.rows.length) {
-      return res.status(404).json({
-        error: { code: "REQUEST_NOT_FOUND", message: "Return request not found." },
-      });
-    }
-
-    const { status } = currentResult.rows[0];
-
-    if (!["Open", "Rejected"].includes(status)) {
-      return res.status(409).json({
-        error: {
-          code: "DELETE_NOT_ALLOWED",
-          message: "Only Open or Rejected requests can be removed.",
-        },
-      });
-    }
-
     const result = await pool.query(
       `UPDATE return_requests
-       SET is_deleted = TRUE, updated_at = NOW()
+       SET is_deleted = TRUE,
+           updated_at = NOW()
        WHERE id = $1
-         AND status IN ('Open', 'Rejected')
          AND is_deleted = FALSE
-       RETURNING id`,
+         AND status IN ('Open', 'Rejected')
+       RETURNING id, reference, status, is_deleted`,
       [id]
     );
 
     if (!result.rows.length) {
-      return res.status(409).json({
-        error: {
-          code: "REQUEST_CHANGED",
-          message: "The request changed. Refresh and try again.",
-        },
-      });
+      const existing = await pool.query(
+        `SELECT id, status, is_deleted
+         FROM return_requests
+         WHERE id = $1`,
+        [id]
+      );
+
+      if (
+        !existing.rows.length ||
+        existing.rows[0].is_deleted
+      ) {
+        return sendError(
+          res,
+          404,
+          "REQUEST_NOT_FOUND",
+          "Return request not found."
+        );
+      }
+
+      return sendError(
+        res,
+        409,
+        "DELETE_NOT_ALLOWED",
+        "Only Open or Rejected requests can be removed."
+      );
     }
 
     return res.status(200).json({
       message: "Return request removed successfully.",
+      data: result.rows[0],
     });
   } catch (error) {
-    console.error("Remove request failed:", error.message);
-    return res.status(500).json({
-      error: {
-        code: "INTERNAL_SERVER_ERROR",
-        message: "Unable to remove return request.",
-      },
-    });
+    return handleDatabaseError(res, error, "Remove return request");
   }
 });
 
